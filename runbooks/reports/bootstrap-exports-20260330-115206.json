@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "started_at": "2026-03-30T11:49:18.438531",
+  "exports_dir": "..\\exports",
+  "rows": {
+    "source_catalog_items": 28804,
+    "source_product_links": 28804,
+    "products": 28804,
+    "product_images": 112514,
+    "product_variants": 151214,
+    "product_tags": 670,
+    "import_runs": 13
+  },
+  "created": {
+    "source_catalog_items": 28804,
+    "products": 28804,
+    "source_product_links": 28804,
+    "product_images": 112514,
+    "product_variants": 151214,
+    "tags": 1,
+    "product_tags": 670,
+    "import_runs": 13,
+    "categories": 3,
+    "variant_color_backfilled": 8825
+  },
+  "updated": {
+    "source_catalog_items": 0,
+    "products": 0,
+    "source_product_links": 28804,
+    "product_images": 0,
+    "product_variants": 0,
+    "import_runs": 0
+  },
+  "skipped": {
+    "rows": 0
+  },
+  "errors": [],
+  "reconciliation": {
+    "source_catalog_items_db": 28804,
+    "products_db": 28804,
+    "product_images_db": 112514,
+    "product_variants_db": 151214,
+    "product_variants_with_color_db": 9795,
+    "product_tags_db": 670,
+    "import_runs_db": 13
+  },
+  "finished_at": "2026-03-30T11:52:06.989518"
+}

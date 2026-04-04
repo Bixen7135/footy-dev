@@ -1,0 +1,17 @@
+{
+  "name": "footy",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:all": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 run",
+    "dev:all:up": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 up",
+    "dev:all:down": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 down",
+    "dev:all:status": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 status",
+    "dev:all:logs": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 logs",
+    "dev:all:smoke": "powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke_isolated.ps1",
+    "dev:data:reset-bootstrap": "powershell -ExecutionPolicy Bypass -File scripts/reset_bootstrap_exports.ps1",
+    "dev:data:assert-clean": "powershell -ExecutionPolicy Bypass -File scripts/assert_no_test_data.ps1",
+    "dev:data:remap-taxonomy": "powershell -ExecutionPolicy Bypass -File scripts/remap_catalog_taxonomy.ps1",
+    "dev:data:repair-media": "powershell -ExecutionPolicy Bypass -File scripts/repair_product_media.ps1"
+  }
+}

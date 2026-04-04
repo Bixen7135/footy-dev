@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+backend/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SQLite
+*.db
+*.sqlite3
+uploads/
+backend/uploads/
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+
+# Env
+.env
+backend/.env
+frontend/.env.local
+
+# Runtime / generated
+exports/
+artifacts/
+backups/
+.run/
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
