@@ -1,21 +1,30 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import bcrypt
 import jwt
-from passlib.context import CryptContext
 
 from .config import get_settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 settings = get_settings()
+MAX_BCRYPT_PASSWORD_BYTES = 72
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    password_bytes = password.encode("utf-8")
+    if len(password_bytes) > MAX_BCRYPT_PASSWORD_BYTES:
+        raise ValueError(f"Password is too long (max {MAX_BCRYPT_PASSWORD_BYTES} UTF-8 bytes)")
+    return bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
+    try:
+        password_bytes = password.encode("utf-8")
+        if len(password_bytes) > MAX_BCRYPT_PASSWORD_BYTES:
+            return False
+        return bcrypt.checkpw(password_bytes, hashed.encode("utf-8"))
+    except (TypeError, ValueError):
+        return False
 
 
 def create_token(subject: str, expires_minutes: int, token_type: str) -> str:

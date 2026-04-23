@@ -29,6 +29,8 @@ artifacts/
 backups/
 .run/
 *.log
+docs/
+session_summary.md
 
 # OS / IDE
 .DS_Store

@@ -132,6 +132,24 @@ def test_auth_refresh_lifecycle_api():
     assert me_logged_out.status_code == 401
 
 
+def test_auth_register_rejects_overlong_password_api():
+    create_db_and_tables()
+    email = f"user-{uuid4().hex[:8]}@example.com"
+    long_password = "x" * 73
+
+    reg = client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "password": long_password,
+            "full_name": "Too Long Password",
+        },
+    )
+
+    assert reg.status_code == 400
+    assert "max 72" in reg.json()["detail"]
+
+
 def test_import_map_sync_flow_api():
     create_db_and_tables()
     admin = _admin_client()

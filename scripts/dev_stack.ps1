@@ -1,8 +1,10 @@
 param(
   [ValidateSet("run", "up", "down", "status", "smoke", "logs")]
   [string]$Action = "up",
-  [int]$BackendPort = 8000,
-  [int]$FrontendPort = 3000
+  [string]$BackendPort = "8000",
+  [string]$FrontendPort = "3000",
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,11 +18,50 @@ $SmokeScript = Join-Path $PSScriptRoot "run_local_smoke_isolated.ps1"
 
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 
+function Convert-ToPort([string]$value, [string]$name, [int]$defaultPort) {
+  if ([string]::IsNullOrWhiteSpace($value)) {
+    return $defaultPort
+  }
+
+  $parsed = 0
+  if (-not [int]::TryParse($value, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt 65535) {
+    throw "$name must be an integer from 1 to 65535. Got '$value'."
+  }
+
+  return $parsed
+}
+
+function Normalize-PortArgs {
+  if ($BackendPort -eq "stack") {
+    Write-Warning "Ignoring legacy argument 'stack'. Use 'bun run dev:all' without extra args."
+    $script:BackendPort = "8000"
+  }
+
+  if ($FrontendPort -eq "stack") {
+    Write-Warning "Ignoring unexpected frontend port value 'stack'."
+    $script:FrontendPort = "3000"
+  }
+
+  if ($ExtraArgs -and ($ExtraArgs -contains "stack")) {
+    Write-Warning "Ignoring extra argument 'stack'."
+  }
+
+  $script:BackendPort = Convert-ToPort -value $BackendPort -name "BackendPort" -defaultPort 8000
+  $script:FrontendPort = Convert-ToPort -value $FrontendPort -name "FrontendPort" -defaultPort 3000
+}
+
+function Ensure-CommandAvailable([string]$commandName, [string]$hint) {
+  if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
+    throw "$commandName is not available. $hint"
+  }
+}
+
 function Resolve-BackendPython {
   $venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
   if (Test-Path $venvPython) {
     return $venvPython
   }
+  Ensure-CommandAvailable -commandName "python" -hint "Install Python 3.12+ or create backend\\.venv."
   return "python"
 }
 
@@ -34,7 +75,38 @@ function Resolve-FrontendCommand([int]$port) {
 
   return @{
     filePath = "node"
-    args = @($nextCli, "dev", "--port", "$port", "--hostname", "localhost")
+    args = @($nextCli, "dev", "--webpack", "--port", "$port", "--hostname", "localhost")
+  }
+}
+
+function Test-CommandSuccess([string]$filePath, [string[]]$argumentList, [string]$workingDirectory, [string]$failureHint) {
+  $probeId = [Guid]::NewGuid().ToString("N")
+  $probeOut = Join-Path $RunDir "probe-$probeId.out.log"
+  $probeErr = Join-Path $RunDir "probe-$probeId.err.log"
+
+  try {
+    $proc = Start-Process -FilePath $filePath `
+      -ArgumentList $argumentList `
+      -WorkingDirectory $workingDirectory `
+      -NoNewWindow `
+      -Wait `
+      -PassThru `
+      -RedirectStandardOutput $probeOut `
+      -RedirectStandardError $probeErr
+
+    if ($proc.ExitCode -ne 0) {
+      $hint = $failureHint
+      if (Test-Path $probeErr) {
+        $stderrTail = (Get-Content $probeErr -Tail 3 -ErrorAction SilentlyContinue) -join "`n"
+        if (-not [string]::IsNullOrWhiteSpace($stderrTail)) {
+          $hint = "$failureHint`n$stderrTail"
+        }
+      }
+      throw $hint
+    }
+  }
+  finally {
+    Remove-Item $probeOut, $probeErr -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -42,7 +114,23 @@ function Read-State {
   if (-not (Test-Path $StatePath)) {
     return $null
   }
-  return Get-Content $StatePath -Raw | ConvertFrom-Json
+
+  try {
+    $raw = Get-Content $StatePath -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+      return $null
+    }
+
+    $state = $raw | ConvertFrom-Json
+    if (-not $state.processes -or -not $state.backend_port -or -not $state.frontend_port) {
+      return $null
+    }
+
+    return $state
+  }
+  catch {
+    return $null
+  }
 }
 
 function Write-State($state) {
@@ -51,7 +139,13 @@ function Write-State($state) {
 
 function Remove-State {
   if (Test-Path $StatePath) {
-    Remove-Item $StatePath -Force
+    try {
+      Remove-Item $StatePath -Force -ErrorAction Stop
+    }
+    catch {
+      # Some Windows setups deny delete in place; clear contents so Read-State treats it as empty.
+      Set-Content -Path $StatePath -Value "" -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -97,7 +191,29 @@ function Stop-ListenersOnPort([int]$port, [string]$label) {
   }
 }
 
+function Wait-ServiceReady([string]$name, [int]$processId, [string]$url, [int]$timeoutSeconds, [string]$errorLogPath) {
+  for ($i = 0; $i -lt $timeoutSeconds; $i++) {
+    if (-not (Get-ProcessSafe -processId $processId)) {
+      Write-Output "$name process exited before becoming ready. Check $errorLogPath"
+      return $false
+    }
+
+    try {
+      Invoke-WebRequest $url -UseBasicParsing | Out-Null
+      return $true
+    }
+    catch {
+      Start-Sleep -Seconds 1
+    }
+  }
+
+  Write-Output "$name did not become ready in time. Check $errorLogPath"
+  return $false
+}
+
 function Start-Stack {
+  Normalize-PortArgs
+
   $state = Read-State
   if ($state) {
     $alive = @()
@@ -121,6 +237,7 @@ function Start-Stack {
   }
 
   $python = Resolve-BackendPython
+  Ensure-CommandAvailable -commandName "node" -hint "Install Node.js LTS so frontend can run Next.js."
 
   $backendOut = Join-Path $RunDir "backend.log"
   $backendErr = Join-Path $RunDir "backend.err.log"
@@ -132,6 +249,16 @@ function Start-Stack {
   Remove-Item $backendOut, $backendErr, $frontendOut, $frontendErr, $workerOut, $workerErr -ErrorAction SilentlyContinue
 
   $frontendCmd = Resolve-FrontendCommand -port $FrontendPort
+
+  Test-CommandSuccess -filePath $python `
+    -argumentList @("-m", "uvicorn", "--help") `
+    -workingDirectory $BackendDir `
+    -failureHint "Python is not ready for backend start. Ensure Python 3.12+ is installed and run: backend\.venv\Scripts\pip install -e ."
+
+  Test-CommandSuccess -filePath "node" `
+    -argumentList @($frontendCmd.args[0], "--version") `
+    -workingDirectory $FrontendDir `
+    -failureHint "Next.js CLI failed to run. Run 'cd frontend; bun install' and retry."
 
   $backend = Start-Process -FilePath $python `
     -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "localhost", "--port", "$BackendPort") `
@@ -169,11 +296,12 @@ function Start-Stack {
     )
   }
 
-  if (-not (Wait-Url "http://localhost:$BackendPort/health" 90)) {
-    Write-Output "Backend did not become healthy in time. Check .run/backend.err.log"
-  }
-  if (-not (Wait-Url "http://localhost:$FrontendPort" 120)) {
-    Write-Output "Frontend did not become ready in time. Check .run/frontend.err.log"
+  $backendReady = Wait-ServiceReady -name "Backend" -processId $backend.Id -url "http://localhost:$BackendPort/health" -timeoutSeconds 90 -errorLogPath ".run/backend.err.log"
+  $frontendReady = Wait-ServiceReady -name "Frontend" -processId $frontend.Id -url "http://localhost:$FrontendPort" -timeoutSeconds 120 -errorLogPath ".run/frontend.err.log"
+
+  if (-not ($backendReady -and $frontendReady)) {
+    Stop-Stack
+    throw "FOOTY stack failed to start. Resolve the errors above and rerun."
   }
 
   Write-Output "FOOTY stack started."

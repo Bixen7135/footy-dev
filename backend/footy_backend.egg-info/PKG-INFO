@@ -9,9 +9,11 @@ Requires-Dist: sqlmodel>=0.0.22
 Requires-Dist: alembic>=1.14.0
 Requires-Dist: pydantic>=2.9.0
 Requires-Dist: pydantic-settings>=2.4.0
-Requires-Dist: passlib[bcrypt]>=1.7.4
+Requires-Dist: bcrypt>=4.1.3
 Requires-Dist: PyJWT>=2.9.0
 Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: lightgbm>=4.5.0
+Requires-Dist: numpy>=1.26.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.3.0; extra == "dev"
 Requires-Dist: httpx>=0.28.0; extra == "dev"

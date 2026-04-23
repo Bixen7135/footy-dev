@@ -223,9 +223,14 @@ def register(
     if existing:
         raise HTTPException(status_code=409, detail="Email already exists")
 
+    try:
+        password_hash = hash_password(payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     user = User(
         email=payload.email.lower(),
-        password_hash=hash_password(payload.password),
+        password_hash=password_hash,
         full_name=payload.full_name,
         phone=payload.phone,
         role=UserRole.CUSTOMER,
@@ -302,7 +307,10 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=400, detail="Current password invalid")
 
-    current_user.password_hash = hash_password(payload.new_password)
+    try:
+        current_user.password_hash = hash_password(payload.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.add(current_user)
     session.commit()
     return {"ok": True}
