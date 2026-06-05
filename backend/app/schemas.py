@@ -230,11 +230,18 @@ class CatalogSizeFacetOut(BaseModel):
     count: int
 
 
+class CatalogBrandFacetOut(BaseModel):
+    key: str
+    label: str
+    count: int
+
+
 class CatalogFacetsOut(BaseModel):
     categories: list[CatalogCategoryFacetOut] = Field(default_factory=list)
     colors: list[CatalogColorFacetOut] = Field(default_factory=list)
     genders: list[CatalogGenderFacetOut] = Field(default_factory=list)
     sizes: list[CatalogSizeFacetOut] = Field(default_factory=list)
+    brands: list[CatalogBrandFacetOut] = Field(default_factory=list)
 
 
 class CatalogAppliedFiltersOut(BaseModel):
@@ -243,6 +250,7 @@ class CatalogAppliedFiltersOut(BaseModel):
     color_keys: list[str] = Field(default_factory=list)
     gender_keys: list[str] = Field(default_factory=list)
     size_keys: list[str] = Field(default_factory=list)
+    brand_keys: list[str] = Field(default_factory=list)
     min_price: Optional[Decimal] = None
     max_price: Optional[Decimal] = None
     in_stock_only: bool = False

@@ -25,7 +25,12 @@ if (-not $SkipBackup) {
 Write-Output "Repairing product media in backend/footy.db..."
 Push-Location $BackendDir
 try {
-  python scripts/repair_product_media.py
+  $python = "python"
+  $venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
+  if (Test-Path $venvPython) {
+    $python = $venvPython
+  }
+  & $python scripts/repair_product_media.py
   if ($LASTEXITCODE -ne 0) {
     throw "repair_product_media.py failed with exit code $LASTEXITCODE"
   }

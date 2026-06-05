@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from sqlmodel import select
+from sqlmodel import func, select
 
 import app.services as services_module
 from app.bootstrap import ExportBootstrapService
@@ -74,6 +74,27 @@ def test_import_deduplication(session):
 
     items = session.exec(select(SourceCatalogItem)).all()
     assert len(items) == 1
+
+
+def test_normalization_prefers_main_catalog_image():
+    item = SourceCatalogItem(
+        id=1,
+        source_system="supplier_images",
+        source_product_id="image-1",
+        source_url="https://supplier.local/image-1",
+        source_title="Image Product",
+        source_category_path="shoes",
+        source_media_json=[
+            "https://cdn.intertop.com/load/mp123/small/2.jpg",
+            "https://cdn.intertop.com/load/mp123/smallest/MAIN.jpg",
+            "https://cdn.intertop.com/load/mp123/medium/MAIN.jpg",
+            "https://cdn.intertop.com/upload/icon.svg",
+        ],
+    )
+
+    normalized = services_module.NormalizationService().normalize_source_item(item)
+
+    assert normalized.images[0] == "https://cdn.intertop.com/load/mp123/medium/MAIN.jpg"
 
 
 def test_publication_requires_mapping(session):
@@ -240,6 +261,120 @@ def test_sync_reuses_product_by_signature_and_upserts_sizes(session):
     ).all()
     assert {(variant.size, variant.color) for variant in variants} == {("42", "Other"), ("43", "Other")}
     assert {variant.size for variant in variants} == {"42", "43"}
+
+
+def test_sync_uses_unique_slug_when_generated_slug_exists(session):
+    category = Category(name="Slug Shoes", slug="slug-shoes")
+    session.add(category)
+    session.commit()
+    session.refresh(category)
+
+    session.add(
+        SourceCategoryMap(
+            source_system="supplier_slug",
+            source_category_key="men/slug-shoes",
+            internal_category_id=category.id,
+        )
+    )
+    session.add(
+        Product(
+            slug="duplicate-model-slug-1",
+            name="Existing duplicate",
+            price=Decimal("1.00"),
+            currency="KZT",
+            category_id=category.id,
+            is_active=True,
+        )
+    )
+    session.commit()
+
+    ingestion = IngestionService()
+    sync = SyncService()
+    ingestion.run_import(
+        session,
+        "supplier_slug",
+        [
+            SourceItemIn(
+                source_system="supplier_slug",
+                source_product_id="slug-1",
+                source_url="https://supplier.slug/p/slug-1",
+                title="Duplicate Model",
+                price=Decimal("90.00"),
+                currency="KZT",
+                category_path="men/slug-shoes",
+                images=["https://img.slug/model.jpg"],
+                stock={"42": 1},
+                last_seen_at=datetime.utcnow(),
+            )
+        ],
+    )
+
+    source_row = session.exec(
+        select(SourceCatalogItem).where(SourceCatalogItem.source_product_id == "slug-1")
+    ).first()
+    decision = sync.sync_source_item(session, source_row)
+    product = session.get(Product, decision.product_id)
+
+    assert product.slug == "duplicate-model-slug-1-1"
+
+
+def test_sync_pending_rolls_back_after_integrity_error(session, monkeypatch):
+    category = Category(name="Rollback Shoes", slug="rollback-shoes")
+    session.add(category)
+    session.commit()
+    session.refresh(category)
+
+    session.add(
+        SourceCategoryMap(
+            source_system="supplier_rollback",
+            source_category_key="men/rollback-shoes",
+            internal_category_id=category.id,
+        )
+    )
+    session.add(
+        Product(
+            slug="rollback-model-1",
+            name="Existing rollback",
+            price=Decimal("1.00"),
+            currency="KZT",
+            category_id=category.id,
+            is_active=True,
+        )
+    )
+    session.commit()
+
+    ingestion = IngestionService()
+    sync = SyncService()
+    monkeypatch.setattr(sync, "_build_unique_product_slug", lambda *_args, **_kwargs: "rollback-model-1")
+
+    ingestion.run_import(
+        session,
+        "supplier_rollback",
+        [
+            SourceItemIn(
+                source_system="supplier_rollback",
+                source_product_id="1",
+                source_url="https://supplier.rollback/p/1",
+                title="Rollback Model",
+                price=Decimal("90.00"),
+                currency="KZT",
+                category_path="men/rollback-shoes",
+                images=["https://img.rollback/model.jpg"],
+                stock={"42": 1},
+                last_seen_at=datetime.utcnow(),
+            )
+        ],
+    )
+
+    decisions = sync.sync_pending(session, limit=1)
+    source_row = session.exec(
+        select(SourceCatalogItem).where(SourceCatalogItem.source_system == "supplier_rollback")
+    ).first()
+    product_count = session.exec(select(func.count(Product.id))).one()
+
+    assert decisions[0].action == "failed"
+    assert source_row.normalized_status == "failed"
+    assert product_count == 1
 
 
 def test_sync_decodes_encoded_sizes_and_ignores_invalid_sizes(session):
@@ -698,8 +833,40 @@ def test_events_batch_persistence(session):
     )
 
     rows = session.exec(select(UserEvent)).all()
-    assert inserted == 2
-    assert len(rows) == 2
+    assert inserted == 1
+    assert len(rows) == 1
+
+
+def test_recommendation_events_guardrails(session):
+    service = EventIngestionService()
+    inserted = service.ingest_batch(
+        session,
+        EventBatchIn(
+            events=[
+                EventIn(
+                    event_type="recommendation_impression",
+                    session_id="s1",
+                    anonymous_id="a1",
+                    recommendation_request_id="req-1",
+                    recommendation_slot="home",
+                    product_id=10,
+                    rank_position=2,
+                ),
+                EventIn(
+                    event_type="recommendation_click",
+                    session_id="s1",
+                    anonymous_id="a1",
+                    recommendation_request_id="",
+                    recommendation_slot="home",
+                    product_id=10,
+                ),
+            ]
+        ),
+    )
+    assert inserted == 1
+    row = session.exec(select(UserEvent).where(UserEvent.event_type == "recommendation_impression")).first()
+    assert row is not None
+    assert row.rank_position == 2
 
 
 def test_recommendations_filter_inactive(session):
@@ -760,6 +927,76 @@ def test_recommendations_filter_inactive(session):
     ids = [item.product_id for item in recs.items]
     assert active.id in ids
     assert inactive.id not in ids
+
+
+def test_recommendations_multi_source_and_quality_metrics(session):
+    category = Category(name="Rec Multi", slug="rec-multi")
+    session.add(category)
+    session.commit()
+    session.refresh(category)
+    p1 = Product(
+        slug="rec-multi-1",
+        name="Rec Multi 1",
+        brand_name="BrandA",
+        price=Decimal("20.00"),
+        currency="KZT",
+        category_id=category.id,
+        is_active=True,
+    )
+    p2 = Product(
+        slug="rec-multi-2",
+        name="Rec Multi 2",
+        brand_name="BrandA",
+        price=Decimal("21.00"),
+        currency="KZT",
+        category_id=category.id,
+        is_active=True,
+    )
+    session.add(p1)
+    session.add(p2)
+    session.commit()
+    session.refresh(p1)
+    session.refresh(p2)
+    session.add(ProductVariant(product_id=p1.id, sku="rec-multi-1-v1", stock_quantity=5, is_active=True))
+    session.add(ProductVariant(product_id=p2.id, sku="rec-multi-2-v1", stock_quantity=5, is_active=True))
+    session.add(
+        UserEvent(event_type="product_view", session_id="s1", anonymous_id="anon-quality", product_id=p1.id, category_id=category.id)
+    )
+    session.add(
+        UserEvent(event_type="product_view", session_id="s1", anonymous_id="anon-quality", product_id=p2.id, category_id=category.id)
+    )
+    session.add(
+        UserEvent(
+            event_type="recommendation_impression",
+            session_id="s1",
+            anonymous_id="anon-quality",
+            product_id=p2.id,
+            recommendation_slot="home",
+            recommendation_request_id="req-1",
+        )
+    )
+    session.add(
+        UserEvent(
+            event_type="recommendation_click",
+            session_id="s1",
+            anonymous_id="anon-quality",
+            product_id=p2.id,
+            recommendation_slot="home",
+            recommendation_request_id="req-1",
+        )
+    )
+    session.add(UserEvent(event_type="add_to_cart", session_id="s1", anonymous_id="anon-quality", product_id=p2.id))
+    session.commit()
+
+    service = RecommendationService()
+    recs = service.get_recommendations(session=session, context="home", limit=5, anonymous_id="anon-quality")
+    assert recs.items
+    assert "+" in recs.items[0].source or recs.items[0].source == "hybrid"
+
+    quality = service.get_quality_metrics(session, window_days=14)
+    assert quality["impressions"] >= 1
+    assert quality["clicks"] >= 1
+    assert quality["add_to_cart_after_rec"] >= 1
 
 
 def test_catalog_filter_by_multiple_categories_and_legacy_id(session):
@@ -1844,8 +2081,8 @@ def test_bootstrap_maps_canonical_categories_and_gender(session, tmp_path):
             {
                 "id": 1,
                 "external_source_system": "supplier_test",
-                "external_source_product_id": "sku-1",
-                "canonical_url": "https://footy.local/p/model-one",
+                "external_source_product_id": "sku:model-one|sig:brandx|women",
+                "canonical_url": "https://supplier.local/item/sku-1",
                 "title": "Model One",
                 "brand_name": "BrandX",
                 "category_slug": "shoes",
@@ -1900,7 +2137,7 @@ def test_bootstrap_maps_canonical_categories_and_gender(session, tmp_path):
     report = service.bootstrap(session)
 
     assert report["ok"] is True
-    product = session.exec(select(Product).where(Product.slug == "model-one-sku-1")).first()
+    product = session.exec(select(Product).where(Product.slug == "model-one-sku-model-one-sig-brandx-women")).first()
     assert product is not None
     category = session.get(Category, product.category_id)
     assert category is not None

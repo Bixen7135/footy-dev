@@ -34,7 +34,7 @@ function Resolve-FrontendCommand([int]$port) {
 
   return @{
     filePath = "node"
-    args = @($nextCli, "dev", "--port", "$port", "--hostname", "localhost")
+    args = @($nextCli, "dev", "--webpack", "--port", "$port", "--hostname", "localhost")
   }
 }
 
@@ -62,6 +62,21 @@ function Get-ProcessSafe([int]$processId) {
   catch {
     return $null
   }
+}
+
+function Stop-ProcessTree([int]$processId, [string]$label) {
+  $proc = Get-ProcessSafe -processId $processId
+  if (-not $proc) {
+    return
+  }
+
+  $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $processId" -ErrorAction SilentlyContinue
+  foreach ($child in $children) {
+    Stop-ProcessTree -processId ([int]$child.ProcessId) -label $label
+  }
+
+  Stop-Process -Id $processId -Force
+  Write-Output "Stopped $label (PID $processId)"
 }
 
 function Test-PortListening([int]$port) {
@@ -193,11 +208,7 @@ function Stop-Stack {
   }
 
   foreach ($entry in $state.processes) {
-    $proc = Get-ProcessSafe -processId $entry.pid
-    if ($proc) {
-      Stop-Process -Id $entry.pid -Force
-      Write-Output "Stopped $($entry.name) (PID $($entry.pid))"
-    }
+    Stop-ProcessTree -processId $entry.pid -label $entry.name
   }
   Stop-ListenersOnPort -port $state.backend_port -label "backend"
   Stop-ListenersOnPort -port $state.frontend_port -label "frontend"

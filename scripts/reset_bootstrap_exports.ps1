@@ -32,7 +32,12 @@ Write-Output "Bootstrapping from exports into backend/footy.db..."
 Push-Location $BackendDir
 try {
   $env:PYTHONIOENCODING = "utf-8"
-  python scripts/bootstrap_from_exports.py
+  $python = "python"
+  $venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
+  if (Test-Path $venvPython) {
+    $python = $venvPython
+  }
+  & $python scripts/bootstrap_from_exports.py
   if ($LASTEXITCODE -ne 0) {
     throw "bootstrap_from_exports.py failed with exit code $LASTEXITCODE"
   }

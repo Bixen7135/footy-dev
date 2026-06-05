@@ -1,0 +1,57 @@
+{
+  "ok": true,
+  "started_at": "2026-05-26T10:46:43.733990",
+  "exports_dir": "..\\exports_prepared_full",
+  "rows": {
+    "source_catalog_items": 25233,
+    "source_product_links": 25233,
+    "products": 11615,
+    "product_images": 201011,
+    "product_variants": 70546,
+    "product_tags": 273,
+    "import_runs": 3
+  },
+  "created": {
+    "source_catalog_items": 25233,
+    "products": 11615,
+    "source_product_links": 13267,
+    "product_images": 78565,
+    "product_variants": 70546,
+    "tags": 1,
+    "product_tags": 273,
+    "import_runs": 3,
+    "categories": 10,
+    "variant_color_backfilled": 0
+  },
+  "updated": {
+    "source_catalog_items": 0,
+    "products": 0,
+    "source_product_links": 0,
+    "product_images": 0,
+    "product_variants": 0,
+    "import_runs": 0,
+    "categories": 0
+  },
+  "skipped": {
+    "rows": 0
+  },
+  "errors": [],
+  "reconciliation": {
+    "source_catalog_items_db": 25233,
+    "products_db": 11615,
+    "product_images_db": 78565,
+    "product_variants_db": 70546,
+    "product_variants_with_color_db": 70546,
+    "product_tags_db": 273,
+    "import_runs_db": 3,
+    "canonical_categories_active_db": 10,
+    "products_with_gender_db": 0,
+    "category_fallback_to_sneakers": 4,
+    "legacy_categories_deactivated": 0,
+    "category_fallback_examples": [
+      "armani футболка",
+      "timberland"
+    ]
+  },
+  "finished_at": "2026-05-26T10:47:38.723929"
+}

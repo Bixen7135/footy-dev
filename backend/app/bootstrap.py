@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -36,6 +37,14 @@ from .taxonomy import (
 from .size_utils import decode_shoe_size_with_quantity
 
 DEFAULT_VARIANT_COLOR = "Other"
+
+field_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(field_limit)
+        break
+    except OverflowError:
+        field_limit //= 10
 
 
 def slugify(value: str) -> str:
@@ -108,6 +117,20 @@ def _parse_bool(raw: Optional[str], default: bool = False) -> bool:
     if value in {"0", "false", "no", "n"}:
         return False
     return default
+
+
+def _resolve_gender_from_source_row(row: dict[str, str], attributes: dict[str, Any]) -> Optional[str]:
+    details = attributes.get("details")
+    if not isinstance(details, dict):
+        details = {}
+    return resolve_gender_key(
+        row.get("root_gender")
+        or attributes.get("root_gender")
+        or details.get("root_gender")
+        or details.get("pol")
+        or attributes.get("pol"),
+        row.get("source_category_path"),
+    )
 
 
 def _parse_int(raw: Optional[str], default: int = 0) -> int:
@@ -431,6 +454,9 @@ class ExportBootstrapService:
         source_key_to_item_id: dict[tuple[str, str], int] = {}
         source_key_to_category_key: dict[tuple[str, str], str] = {}
         source_key_to_gender_key: dict[tuple[str, str], str] = {}
+        source_url_to_category_key: dict[str, str] = {}
+        source_url_to_gender_key: dict[str, str] = {}
+        source_product_id_to_gender_key: dict[tuple[str, str], str] = {}
         category_fallback_examples: list[str] = []
         category_fallback_seen: set[str] = set()
         category_fallback_count = 0
@@ -487,9 +513,15 @@ class ExportBootstrapService:
                     if len(category_fallback_examples) < 20:
                         category_fallback_examples.append(category_resolution.source_leaf)
             source_key_to_category_key[key] = category_resolution.key
-            gender_key = resolve_gender_key(row.get("root_gender"), payload["source_category_path"])
+            source_url = payload["source_url"]
+            if source_url:
+                source_url_to_category_key[source_url] = category_resolution.key
+            gender_key = _resolve_gender_from_source_row(row, attributes)
             if gender_key:
                 source_key_to_gender_key[key] = gender_key
+                source_product_id_to_gender_key[key] = gender_key
+                if source_url:
+                    source_url_to_gender_key[source_url] = gender_key
 
             if existing:
                 for key_name, value in payload.items():
@@ -528,7 +560,8 @@ class ExportBootstrapService:
             slug_candidate = slugify(f"{row.get('title') or source_product_id}-{source_product_id}")
             product = linked_product or session.exec(select(Product).where(Product.slug == slug_candidate)).first()
 
-            category_key = source_key_to_category_key.get(source_key)
+            canonical_url = (row.get("canonical_url") or "").strip()
+            category_key = source_key_to_category_key.get(source_key) or source_url_to_category_key.get(canonical_url)
             if not category_key:
                 fallback_resolution = resolve_canonical_category(
                     None,
@@ -542,8 +575,14 @@ class ExportBootstrapService:
                 canonical_categories_by_key[fallback.key] = category
             price = _parse_decimal(row.get("current_price")) or Decimal("0")
             compare_price = _parse_decimal(row.get("compare_at_price"))
-            is_active = _parse_bool(row.get("is_active"), True)
-            gender_key = source_key_to_gender_key.get(source_key) or resolve_gender_key(row.get("gender"))
+            has_active_price = price > 0
+            is_active = _parse_bool(row.get("is_active"), True) and has_active_price
+            gender_key = (
+                source_key_to_gender_key.get(source_key)
+                or source_url_to_gender_key.get(canonical_url)
+                or source_product_id_to_gender_key.get((source_system, source_product_id))
+                or resolve_gender_key(row.get("gender") or row.get("pol"))
+            )
 
             if product:
                 product.name = (row.get("title") or "").strip() or product.name

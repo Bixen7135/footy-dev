@@ -173,15 +173,32 @@ class RankerArtifacts:
                 num_boost_round=80,
             )
             booster.save_model(str(self.model_path))
-            preds = booster.predict(x)
-            rmse = float(np.sqrt(np.mean((preds - y) ** 2))) if len(y) else None
+            split_idx = max(1, int(len(rows) * 0.8))
+            eval_x = x[split_idx:] if split_idx < len(rows) else x
+            eval_y = y[split_idx:] if split_idx < len(rows) else y
+            preds_train = booster.predict(x)
+            preds_eval = booster.predict(eval_x) if len(eval_x) else preds_train
+            train_rmse = float(np.sqrt(np.mean((preds_train - y) ** 2))) if len(y) else None
+            validation_rmse = float(np.sqrt(np.mean((preds_eval - eval_y) ** 2))) if len(eval_y) else None
+            ndcg_at_10 = None
+            if len(eval_y):
+                order = np.argsort(-preds_eval)
+                k = min(10, len(order))
+                ranked_labels = eval_y[order][:k]
+                discounts = 1.0 / np.log2(np.arange(2, k + 2))
+                dcg = float(np.sum(ranked_labels * discounts))
+                ideal_labels = np.sort(eval_y)[::-1][:k]
+                idcg = float(np.sum(ideal_labels * discounts))
+                ndcg_at_10 = float(dcg / idcg) if idcg > 1e-9 else 0.0
             meta = {
                 "is_ready": True,
                 "model_version": model_version,
                 "trained_at": trained_at,
                 "rows": len(rows),
                 "features": FEATURE_KEYS,
-                "train_rmse": rmse,
+                "train_rmse": train_rmse,
+                "validation_rmse": validation_rmse,
+                "validation_ndcg_at_10": ndcg_at_10,
                 "fallback_reason": None,
                 "model_path": str(self.model_path),
                 "dataset_path": str(self.dataset_path),
@@ -237,4 +254,3 @@ class RankerArtifacts:
             product_id = int(row["product_id"])
             by_product[product_id] = float(value)
         return by_product, None
-

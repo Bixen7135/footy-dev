@@ -211,6 +211,20 @@ def _parse_size_keys(size_keys: Optional[str]) -> list[str]:
     return parsed
 
 
+def _parse_brand_keys(brand_keys: Optional[str]) -> list[str]:
+    if not brand_keys:
+        return []
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for raw in brand_keys.split(","):
+        value = " ".join(raw.strip().lower().split())
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        parsed.append(value)
+    return parsed
+
+
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -476,6 +490,7 @@ def list_products(
     category_ids: Optional[str] = Query(default=None),
     color_keys: Optional[str] = Query(default=None),
     gender_keys: Optional[str] = Query(default=None),
+    brand_keys: Optional[str] = Query(default=None),
     min_price: Optional[Decimal] = None,
     max_price: Optional[Decimal] = None,
     in_stock_only: bool = False,
@@ -486,6 +501,7 @@ def list_products(
     parsed_category_ids = _parse_category_ids(category_ids)
     parsed_color_keys = _parse_color_keys(color_keys)
     parsed_gender_keys = _parse_gender_keys(gender_keys)
+    parsed_brand_keys = _parse_brand_keys(brand_keys)
     return catalog_service.list_products(
         session=session,
         search=search,
@@ -493,6 +509,7 @@ def list_products(
         category_ids=parsed_category_ids,
         color_keys=parsed_color_keys,
         gender_keys=parsed_gender_keys,
+        brand_keys=parsed_brand_keys,
         min_price=min_price,
         max_price=max_price,
         in_stock_only=in_stock_only,
@@ -509,6 +526,7 @@ def list_catalog_products(
     color_keys: Optional[str] = Query(default=None),
     gender_keys: Optional[str] = Query(default=None),
     size_keys: Optional[str] = Query(default=None),
+    brand_keys: Optional[str] = Query(default=None),
     min_price: Optional[Decimal] = None,
     max_price: Optional[Decimal] = None,
     in_stock_only: bool = False,
@@ -520,6 +538,7 @@ def list_catalog_products(
     parsed_color_keys = _parse_color_keys(color_keys)
     parsed_gender_keys = _parse_gender_keys(gender_keys)
     parsed_size_keys = _parse_size_keys(size_keys)
+    parsed_brand_keys = _parse_brand_keys(brand_keys)
     return catalog_service.list_catalog_products(
         session=session,
         search=search,
@@ -528,6 +547,7 @@ def list_catalog_products(
         color_keys=parsed_color_keys,
         gender_keys=parsed_gender_keys,
         size_keys=parsed_size_keys,
+        brand_keys=parsed_brand_keys,
         min_price=min_price,
         max_price=max_price,
         in_stock_only=in_stock_only,
@@ -883,6 +903,8 @@ def add_cart_item(
         raise HTTPException(status_code=404, detail="Product not found")
     if not product.is_active:
         raise HTTPException(status_code=409, detail="Product is inactive")
+    if product.price is None or product.price <= 0:
+        raise HTTPException(status_code=409, detail="Product price unavailable")
 
     resolved_variant_id = payload.variant_id
     if payload.variant_id:
@@ -1312,12 +1334,22 @@ def recommendation_jobs(
                     "recompute_similarity_job",
                     "build_training_dataset_job",
                     "train_ranker_job",
+                    "recommendation_shadow_eval_job",
                 ]
             )
         )
         .order_by(JobRun.started_at.desc())
         .limit(100)
     ).all()
+
+
+@recommendations_router.get("/admin/recommendations/quality")
+def recommendation_quality(
+    days: int = 7,
+    _: User = Depends(require_admin),
+    session: Session = Depends(get_db_session),
+):
+    return recommendation_service.get_quality_metrics(session=session, window_days=days)
 
 
 analytics_router = APIRouter(prefix="/admin/analytics", tags=["analytics"])
@@ -1418,6 +1450,7 @@ def run_job(
         "recompute_similarity_job": job_orchestrator.run_recompute_similarity_job,
         "build_training_dataset_job": job_orchestrator.run_build_training_dataset_job,
         "train_ranker_job": job_orchestrator.run_train_ranker_job,
+        "recommendation_shadow_eval_job": job_orchestrator.run_recommendation_shadow_eval_job,
         "dedupe_products_dry_run_job": job_orchestrator.run_dedupe_products_dry_run_job,
         "dedupe_products_apply_job": job_orchestrator.run_dedupe_products_apply_job,
         "refresh_product_primary_images_job": job_orchestrator.run_refresh_product_primary_images_job,

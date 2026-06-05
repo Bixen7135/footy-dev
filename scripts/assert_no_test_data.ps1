@@ -16,7 +16,12 @@ $ResolvedDbPath = (Resolve-Path $CandidatePath).Path
 
 Push-Location $BackendDir
 try {
-  python scripts/assert_no_test_data.py --db-path "$ResolvedDbPath"
+  $python = "python"
+  $venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
+  if (Test-Path $venvPython) {
+    $python = $venvPython
+  }
+  & $python scripts/assert_no_test_data.py --db-path "$ResolvedDbPath"
   if ($LASTEXITCODE -ne 0) {
     throw "Test/demo markers found in DB."
   }

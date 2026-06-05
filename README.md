@@ -7,7 +7,23 @@ Monorepo includes:
 
 ## Quickstart
 
-1. Install dependencies once
+Start the full local stack from the repo root:
+```bash
+bun run dev
+```
+This creates missing local env files, creates `backend/.venv` if needed, installs missing frontend dependencies, then starts backend + frontend + worker. `Ctrl+C` stops the stack.
+
+Frontend: `http://localhost:3000`  
+Backend: `http://localhost:8000`
+
+If dependencies are already installed and you want to skip install checks:
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/start.ps1 -SkipInstall
+```
+
+## Manual Setup
+
+1. Install dependencies manually
 ```bash
 cd backend
 python -m venv .venv
@@ -39,7 +55,7 @@ bun run dev:data:remap-taxonomy
 bun run dev:data:repair-media
 ```
 
-3. Start full local stack (one command)
+3. Start full local stack
 ```bash
 bun run dev:all
 ```

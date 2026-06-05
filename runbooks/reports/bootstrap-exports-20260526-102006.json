@@ -1,0 +1,73 @@
+{
+  "ok": true,
+  "started_at": "2026-05-26T10:18:23.845532",
+  "exports_dir": "..\\exports",
+  "rows": {
+    "source_catalog_items": 28804,
+    "source_product_links": 28804,
+    "products": 28804,
+    "product_images": 112514,
+    "product_variants": 151214,
+    "product_tags": 670,
+    "import_runs": 13
+  },
+  "created": {
+    "source_catalog_items": 28804,
+    "products": 28804,
+    "source_product_links": 28804,
+    "product_images": 82484,
+    "product_variants": 151214,
+    "tags": 1,
+    "product_tags": 670,
+    "import_runs": 13,
+    "categories": 10,
+    "variant_color_backfilled": 150244
+  },
+  "updated": {
+    "source_catalog_items": 0,
+    "products": 0,
+    "source_product_links": 28804,
+    "product_images": 0,
+    "product_variants": 0,
+    "import_runs": 0,
+    "categories": 0
+  },
+  "skipped": {
+    "rows": 0
+  },
+  "errors": [],
+  "reconciliation": {
+    "source_catalog_items_db": 28804,
+    "products_db": 28804,
+    "product_images_db": 82484,
+    "product_variants_db": 151214,
+    "product_variants_with_color_db": 151214,
+    "product_tags_db": 670,
+    "import_runs_db": 13,
+    "canonical_categories_active_db": 10,
+    "products_with_gender_db": 28804,
+    "category_fallback_to_sneakers": 134,
+    "legacy_categories_deactivated": 0,
+    "category_fallback_examples": [
+      "главная",
+      "skechers",
+      "timberland",
+      "geox",
+      "braska",
+      "vagabond",
+      "guess",
+      "nerogiardini",
+      "bronx",
+      "jack",
+      "hilfiger",
+      "tamaris",
+      "klein",
+      "betsy",
+      "exchange",
+      "pikolinos",
+      "tozzi",
+      "armani футболка"
+    ]
+  },
+  "finished_at": "2026-05-26T10:20:06.932183"
+}

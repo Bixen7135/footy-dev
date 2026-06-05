@@ -16,7 +16,12 @@ if ($dbUrl -notlike "*footy-smoke.db*") {
 
 Write-Output "Seeding demo data..."
 Push-Location backend
-python scripts/seed_demo_data.py
+$python = "python"
+$venvPython = Join-Path (Get-Location) ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+  $python = $venvPython
+}
+& $python scripts/seed_demo_data.py
 Pop-Location
 
 Write-Output "Checking backend health..."

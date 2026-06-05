@@ -5,13 +5,19 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from .config import get_settings
 
+from sqlalchemy.pool import NullPool
+
 settings = get_settings()
 connect_args = (
     {"check_same_thread": False, "timeout": 30}
     if settings.database_url.startswith("sqlite")
     else {}
 )
-engine = create_engine(settings.database_url, echo=False, connect_args=connect_args)
+engine_args = {"echo": False, "connect_args": connect_args}
+if settings.database_url.startswith("sqlite"):
+    engine_args["poolclass"] = NullPool
+
+engine = create_engine(settings.database_url, **engine_args)
 
 if settings.database_url.startswith("sqlite"):
     @event.listens_for(engine, "connect")

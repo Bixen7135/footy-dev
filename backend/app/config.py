@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     ranker_meta_filename: str = "meta.json"
     ranker_dataset_filename: str = "training_dataset.jsonl"
     ranker_min_rows: int = 100
+    recommendation_ranking_v2_enabled: bool = True
 
 
 @lru_cache

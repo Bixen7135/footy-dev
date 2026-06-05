@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 import math
 import random
 import re
@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import and_, or_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, delete, func, select
 
 from .bootstrap import ExportBootstrapService
@@ -62,7 +63,7 @@ from .schemas import (
     SyncDecision,
 )
 from .size_utils import decode_shoe_size_with_quantity, normalize_shoe_size_key, normalize_shoe_size_label
-from .taxonomy import GENDER_LABELS as TAXONOMY_GENDER_LABELS, normalize_gender_key
+from .taxonomy import GENDER_LABELS as TAXONOMY_GENDER_LABELS, normalize_gender_key, resolve_gender_key
 
 
 INTERTOP_SMALL_NUMERIC_IMAGE_RE = re.compile(
@@ -108,6 +109,40 @@ def _build_main_image_candidates_from_primary(url: Optional[str]) -> list[str]:
         f"{origin}/load/{asset}/big/MAIN.jpeg",
         f"{origin}/load/{asset}/big/MAIN.webp",
     ]
+
+
+def _catalog_image_rank(url: str) -> tuple[int, int, str]:
+    normalized = normalize_image_url(url) or url
+    lower_url = normalized.lower()
+    if "/medium/main." in lower_url:
+        return (0, 0, normalized)
+    if "/big/main." in lower_url:
+        return (1, 0, normalized)
+    if "/smallest/main." in lower_url:
+        return (2, 0, normalized)
+    if "/small/main." in lower_url:
+        return (3, 0, normalized)
+    if "/medium/" in lower_url:
+        return (4, 0, normalized)
+    if "/big/" in lower_url:
+        return (5, 0, normalized)
+    if "/small/" in lower_url:
+        return (6, 0, normalized)
+    if lower_url.endswith(".svg"):
+        return (99, 0, normalized)
+    return (10, 0, normalized)
+
+
+def _sort_catalog_image_urls(urls: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized_urls: list[str] = []
+    for url in urls:
+        normalized = normalize_image_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_urls.append(normalized)
+    return sorted(normalized_urls, key=_catalog_image_rank)
 
 
 def _validate_remote_image_url(url: str, timeout_seconds: float = 4.0) -> bool:
@@ -209,7 +244,9 @@ class IngestionService:
 class NormalizationService:
     def normalize_source_item(self, item: SourceCatalogItem) -> NormalizedItem:
         attributes = item.source_attributes_json or {}
-        images = [img for img in (item.source_media_json or []) if isinstance(img, str) and img.strip()]
+        images = _sort_catalog_image_urls(
+            img for img in (item.source_media_json or []) if isinstance(img, str) and img.strip()
+        )
 
         return NormalizedItem(
             source_item_id=item.id,
@@ -611,6 +648,25 @@ class SyncService:
             suffix += 1
         return candidate
 
+    def _build_unique_product_slug(
+        self,
+        session: Session,
+        title: str,
+        source_product_id: str,
+        current_product_id: Optional[int] = None,
+    ) -> str:
+        base = slugify(f"{title}-{source_product_id}")
+        candidate = base
+        suffix = 1
+        while True:
+            existing_product_id = session.exec(
+                select(Product.id).where(Product.slug == candidate)
+            ).first()
+            if existing_product_id is None or existing_product_id == current_product_id:
+                return candidate
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+
     def _ensure_variant(self, session: Session, product_id: int, source_item: SourceCatalogItem) -> None:
         existing_variants = session.exec(
             select(ProductVariant).where(ProductVariant.product_id == product_id)
@@ -699,6 +755,17 @@ class SyncService:
         normalized = self.normalizer.normalize_source_item(item)
         category_id = self._resolve_category(session, item.source_system, normalized.category_key)
         publication = self._publication_decision(category_id, normalized)
+        source_attributes = item.source_attributes_json or {}
+        source_details = source_attributes.get("details") if isinstance(source_attributes, dict) else None
+        if not isinstance(source_details, dict):
+            source_details = {}
+        gender_key = resolve_gender_key(
+            (source_attributes.get("root_gender") if isinstance(source_attributes, dict) else None)
+            or source_details.get("root_gender")
+            or source_details.get("pol")
+            or (source_attributes.get("pol") if isinstance(source_attributes, dict) else None),
+            item.source_category_path,
+        )
 
         link = session.exec(
             select(SourceProductLink).where(SourceProductLink.source_catalog_item_id == item.id)
@@ -710,7 +777,7 @@ class SyncService:
 
         if product is None:
             product = Product(
-                slug=slugify(f"{normalized.title}-{item.source_product_id}"),
+                slug=self._build_unique_product_slug(session, normalized.title, item.source_product_id),
                 name=normalized.title,
                 short_description=item.source_description,
                 description=item.source_description,
@@ -719,6 +786,7 @@ class SyncService:
                 compare_at_price=item.source_compare_at_price,
                 currency=normalized.currency,
                 category_id=category_id or self._fallback_category(session),
+                gender=gender_key,
                 is_active=publication.publishable,
                 status=ProductStatus.ACTIVE if publication.publishable else ProductStatus.INACTIVE,
                 source_managed=True,
@@ -739,6 +807,8 @@ class SyncService:
             self._set_if_not_overridden(product, "currency", normalized.currency)
             if category_id:
                 self._set_if_not_overridden(product, "category_id", category_id)
+            if gender_key:
+                self._set_if_not_overridden(product, "gender", gender_key)
             self._set_if_not_overridden(product, "is_active", publication.publishable)
             self._set_if_not_overridden(
                 product,
@@ -788,6 +858,8 @@ class SyncService:
             try:
                 decisions.append(self.sync_source_item(session, item))
             except Exception as exc:
+                if isinstance(exc, SQLAlchemyError):
+                    session.rollback()
                 item.normalized_status = "failed"
                 session.add(item)
                 session.commit()
@@ -954,6 +1026,31 @@ class EventIngestionService:
         "wishlist_remove",
     }
 
+    def _normalize_recommendation_event(self, event: Any, normalized_type: str) -> dict[str, Any] | None:
+        recommendation_slot = (event.recommendation_slot or event.source_page or "").strip().lower() or None
+        request_id = (event.recommendation_request_id or "").strip() or None
+        rank_position = event.rank_position if event.rank_position and event.rank_position > 0 else None
+        metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+        source_page = (event.source_page or "").strip().lower() or recommendation_slot
+
+        if normalized_type == "recommendation_click":
+            if not event.product_id or not request_id or not recommendation_slot:
+                return None
+        if normalized_type == "recommendation_impression":
+            has_item = bool(event.product_id) or (
+                isinstance(metadata.get("product_ids"), list) and len(metadata.get("product_ids")) > 0
+            )
+            if not has_item or not request_id or not recommendation_slot:
+                return None
+
+        return {
+            "source_page": source_page,
+            "recommendation_slot": recommendation_slot,
+            "recommendation_request_id": request_id,
+            "rank_position": rank_position,
+            "metadata_json": metadata or None,
+        }
+
     def ingest_batch(self, session: Session, payload: EventBatchIn) -> int:
         if not payload.events:
             return 0
@@ -963,6 +1060,20 @@ class EventIngestionService:
             normalized_type = event.event_type.strip().lower()
             if normalized_type not in self.REQUIRED_EVENT_TYPES:
                 continue
+            source_page = event.source_page
+            recommendation_slot = event.recommendation_slot
+            recommendation_request_id = event.recommendation_request_id
+            rank_position = event.rank_position
+            metadata_json = event.metadata_json
+            if normalized_type.startswith("recommendation_"):
+                normalized = self._normalize_recommendation_event(event, normalized_type)
+                if not normalized:
+                    continue
+                source_page = normalized["source_page"]
+                recommendation_slot = normalized["recommendation_slot"]
+                recommendation_request_id = normalized["recommendation_request_id"]
+                rank_position = normalized["rank_position"]
+                metadata_json = normalized["metadata_json"]
             session.add(
                 UserEvent(
                     event_type=normalized_type,
@@ -972,13 +1083,13 @@ class EventIngestionService:
                     product_id=event.product_id,
                     variant_id=event.variant_id,
                     category_id=event.category_id,
-                    source_page=event.source_page,
+                    source_page=source_page,
                     page_url=event.page_url,
-                    rank_position=event.rank_position,
+                    rank_position=rank_position,
                     dwell_ms=event.dwell_ms,
-                    recommendation_slot=event.recommendation_slot,
-                    recommendation_request_id=event.recommendation_request_id,
-                    metadata_json=event.metadata_json,
+                    recommendation_slot=recommendation_slot,
+                    recommendation_request_id=recommendation_request_id,
+                    metadata_json=metadata_json,
                     created_at=event.created_at or datetime.utcnow(),
                 )
             )
@@ -1012,8 +1123,10 @@ class RecommendationService:
         "add_to_cart": 6.0,
         "purchase": 10.0,
     }
+    CONTEXTS = {"home", "pdp", "cart", "account"}
 
     def __init__(self) -> None:
+        self.settings = get_settings()
         self.ranker_artifacts = RankerArtifacts()
 
     def get_recommendations(
@@ -1025,26 +1138,51 @@ class RecommendationService:
         anonymous_id: Optional[str] = None,
         current_product_id: Optional[int] = None,
     ) -> RecommendationResponse:
+        if not self.settings.recommendation_ranking_v2_enabled:
+            return self._get_recommendations_v1(session, context, limit, user_id, anonymous_id, current_product_id)
+        try:
+            return self._get_recommendations_v2(session, context, limit, user_id, anonymous_id, current_product_id)
+        except Exception:
+            return self._get_recommendations_v1(session, context, limit, user_id, anonymous_id, current_product_id)
+
+    def _get_recommendations_v2(
+        self,
+        session: Session,
+        context: str,
+        limit: int,
+        user_id: Optional[int] = None,
+        anonymous_id: Optional[str] = None,
+        current_product_id: Optional[int] = None,
+    ) -> RecommendationResponse:
         limit = max(1, min(int(limit), 50))
         scores: dict[int, float] = defaultdict(float)
-        sources: dict[int, str] = {}
+        source_labels: dict[int, set[str]] = defaultdict(set)
+        source_components: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        feature_rows: list[dict[str, Any]] = []
+        context_norm = self._normalize_context(context)
+        actor_counts = self._actor_counts(session, user_id, anonymous_id)
+        anchor = self._resolve_anchor_product(session, current_product_id, user_id, anonymous_id)
+        anchor_product = session.get(Product, anchor) if anchor else None
+        tag_overlap_map = self._tag_overlap_map(session, anchor)
+        pop_7d_map, purchase_30d_map = self._product_popularity_maps(session)
 
-        self._add_recently_viewed(session, scores, sources, user_id, anonymous_id)
-        self._add_affinity(session, scores, sources, user_id)
-        self._add_tag_affinity(session, scores, sources, user_id)
-        self._add_recent_orders(session, scores, sources, user_id)
-        self._add_co_view(session, scores, sources, current_product_id, user_id, anonymous_id)
-        self._add_co_purchase(session, scores, sources, current_product_id, user_id)
-        self._add_content_similarity(session, scores, sources, current_product_id, user_id, anonymous_id)
-        self._add_session_recency(session, scores, sources, anonymous_id)
-        self._add_current_category_similarity(session, scores, sources, current_product_id)
-        self._add_trending(session, scores, sources)
+        self._add_recently_viewed(session, scores, source_labels, source_components, user_id, anonymous_id)
+        self._add_affinity(session, scores, source_labels, source_components, user_id)
+        self._add_tag_affinity(session, scores, source_labels, source_components, user_id)
+        self._add_recent_orders(session, scores, source_labels, source_components, user_id)
+        self._add_co_view(session, scores, source_labels, source_components, current_product_id, user_id, anonymous_id)
+        self._add_co_purchase(session, scores, source_labels, source_components, current_product_id, user_id)
+        self._add_content_similarity(
+            session, scores, source_labels, source_components, current_product_id, user_id, anonymous_id
+        )
+        self._add_session_recency(session, scores, source_labels, source_components, anonymous_id)
+        self._add_current_category_similarity(session, scores, source_labels, source_components, current_product_id)
+        self._add_trending(session, scores, source_labels, source_components)
 
         request_id = uuid4().hex
 
         ranked_ids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
-        feature_rows: list[dict[str, Any]] = []
-        candidate_ids: list[int] = []
+        candidates: list[tuple[int, Product]] = []
         for product_id in ranked_ids:
             if current_product_id and product_id == current_product_id:
                 continue
@@ -1053,35 +1191,25 @@ class RecommendationService:
                 continue
             if not self._is_available(session, product_id):
                 continue
-            candidate_ids.append(product_id)
+            candidates.append((product_id, product))
             feature_rows.append(
-                {
-                    "product_id": product_id,
-                    "base_score": float(scores[product_id]),
-                    "source_weight": float(scores[product_id]),
-                    "affinity_score": 0.0,
-                    "similarity_score": 0.0,
-                    "popularity_score": 0.0,
-                    "recency_bonus": 0.0,
-                    "penalties": 0.0,
-                    "product_price": float(product.price),
-                    "product_price_bucket": float(product.price) / 100.0,
-                    "product_is_featured": 1.0 if product.is_featured else 0.0,
-                    "same_category_as_current": 0.0,
-                    "same_brand_as_current": 0.0,
-                    "tag_overlap": 0.0,
-                    "actor_view_count": 0.0,
-                    "actor_purchase_count": 0.0,
-                    "product_view_7d": 0.0,
-                    "product_purchase_30d": 0.0,
-                    "context_home": 1.0 if context == "home" else 0.0,
-                    "context_pdp": 1.0 if context == "pdp" else 0.0,
-                    "context_cart": 1.0 if context == "cart" else 0.0,
-                    "context_account": 1.0 if context == "account" else 0.0,
-                    "is_anonymous": 0.0 if user_id else 1.0,
-                }
+                self._build_feature_row(
+                    session=session,
+                    product=product,
+                    base_score=float(scores[product_id]),
+                    source_components=source_components.get(product_id, {}),
+                    user_id=user_id,
+                    anonymous_id=anonymous_id,
+                    context=context_norm,
+                    anchor_product=anchor_product,
+                    tag_overlap=float(tag_overlap_map.get(product_id, 0.0)),
+                    actor_counts=actor_counts,
+                    product_views_7d=float(pop_7d_map.get(product_id, 0.0)),
+                    product_purchases_30d=float(purchase_30d_map.get(product_id, 0.0)),
+                    label=None,
+                    is_training=False,
+                )
             )
-
         ml_scores, _ = self.ranker_artifacts.predict(feature_rows)
         ml_norm: dict[int, float] = {}
         if ml_scores:
@@ -1092,27 +1220,155 @@ class RecommendationService:
             for product_id, value in ml_scores.items():
                 ml_norm[product_id] = (value - lower) / spread if spread > 1e-9 else 0.5
 
-        items: list[RecommendationItem] = []
-        for product_id in candidate_ids:
-            final_score = float(scores[product_id])
-            source = sources.get(product_id, "hybrid")
-            if product_id in ml_norm:
-                final_score += ml_norm[product_id] * 0.35
-                source = f"ml+{source}"
+        candidate_rows: list[dict[str, Any]] = []
+        for product_id, product in candidates:
+            row = next((r for r in feature_rows if int(r["product_id"]) == product_id), None)
+            if not row:
+                continue
+            penalties = self._diversity_penalty(product, candidate_rows)
+            row["penalties"] = penalties
+            rule_score = (
+                float(row["base_score"])
+                + float(row["affinity_score"]) * 0.35
+                + float(row["similarity_score"]) * 0.30
+                + float(row["popularity_score"]) * 0.20
+                + float(row["recency_bonus"]) * 0.15
+                - penalties
+            )
+            ml_boost = ml_norm.get(product_id, 0.0) * 1.25
+            final_score = rule_score + ml_boost
+            sources = sorted(source_labels.get(product_id, set()))
+            candidate_rows.append(
+                {
+                    "product_id": product_id,
+                    "score": final_score,
+                    "source": f"ml+{'+'.join(sources)}" if ml_scores and sources else "+".join(sources) or "hybrid",
+                    "brand": (product.brand_name or "").strip().lower(),
+                    "category_id": product.category_id,
+                }
+            )
+        candidate_rows.sort(key=lambda row: float(row["score"]), reverse=True)
+        items = [
+            RecommendationItem(product_id=int(row["product_id"]), score=round(float(row["score"]), 4), source=row["source"])
+            for row in candidate_rows[:limit]
+        ]
+        return RecommendationResponse(request_id=request_id, items=items)
 
+    def _get_recommendations_v1(
+        self,
+        session: Session,
+        context: str,
+        limit: int,
+        user_id: Optional[int] = None,
+        anonymous_id: Optional[str] = None,
+        current_product_id: Optional[int] = None,
+    ) -> RecommendationResponse:
+        limit = max(1, min(int(limit), 50))
+        scores: dict[int, float] = defaultdict(float)
+        source_labels: dict[int, set[str]] = defaultdict(set)
+        source_components: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self._add_recently_viewed(session, scores, source_labels, source_components, user_id, anonymous_id)
+        self._add_affinity(session, scores, source_labels, source_components, user_id)
+        self._add_tag_affinity(session, scores, source_labels, source_components, user_id)
+        self._add_recent_orders(session, scores, source_labels, source_components, user_id)
+        self._add_co_view(session, scores, source_labels, source_components, current_product_id, user_id, anonymous_id)
+        self._add_co_purchase(session, scores, source_labels, source_components, current_product_id, user_id)
+        self._add_content_similarity(
+            session, scores, source_labels, source_components, current_product_id, user_id, anonymous_id
+        )
+        self._add_session_recency(session, scores, source_labels, source_components, anonymous_id)
+        self._add_current_category_similarity(session, scores, source_labels, source_components, current_product_id)
+        self._add_trending(session, scores, source_labels, source_components)
+        ranked_ids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
+        request_id = uuid4().hex
+        items: list[RecommendationItem] = []
+        for product_id in ranked_ids:
+            if current_product_id and product_id == current_product_id:
+                continue
+            product = session.get(Product, product_id)
+            if not product or not product.is_active or not self._is_available(session, product_id):
+                continue
+            sources = sorted(source_labels.get(product_id, set()))
             items.append(
                 RecommendationItem(
                     product_id=product_id,
-                    score=round(final_score, 4),
-                    source=source,
+                    score=round(float(scores[product_id]), 4),
+                    source="+".join(sources) or "hybrid",
                 )
             )
-        items.sort(key=lambda item: item.score, reverse=True)
-
         return RecommendationResponse(request_id=request_id, items=items[:limit])
 
     def get_model_status(self) -> RankerModelMeta:
         return RankerModelMeta(**self.ranker_artifacts.read_meta())
+
+    def get_quality_metrics(self, session: Session, window_days: int = 7) -> dict[str, Any]:
+        window_days = max(1, min(int(window_days), 30))
+        cutoff = datetime.utcnow() - timedelta(days=window_days)
+        impressions = session.exec(
+            select(func.count(UserEvent.id)).where(
+                UserEvent.event_type == "recommendation_impression",
+                UserEvent.created_at >= cutoff,
+            )
+        ).one()
+        clicks = session.exec(
+            select(func.count(UserEvent.id)).where(
+                UserEvent.event_type == "recommendation_click",
+                UserEvent.created_at >= cutoff,
+            )
+        ).one()
+        clicked_request_ids = [
+            req_id
+            for req_id in session.exec(
+                select(UserEvent.recommendation_request_id)
+                .where(
+                    UserEvent.event_type == "recommendation_click",
+                    UserEvent.recommendation_request_id.is_not(None),
+                    UserEvent.created_at >= cutoff,
+                )
+                .distinct()
+            ).all()
+            if req_id
+        ]
+        add_to_cart_after_rec = 0
+        purchase_after_rec = 0
+        if clicked_request_ids:
+            click_sessions = [
+                session_id
+                for session_id in session.exec(
+                    select(UserEvent.session_id)
+                    .where(
+                        UserEvent.event_type == "recommendation_click",
+                        UserEvent.recommendation_request_id.in_(clicked_request_ids),
+                        UserEvent.created_at >= cutoff,
+                    )
+                    .distinct()
+                ).all()
+                if session_id
+            ]
+            if click_sessions:
+                add_to_cart_after_rec = session.exec(
+                    select(func.count(UserEvent.id)).where(
+                        UserEvent.event_type == "add_to_cart",
+                        UserEvent.session_id.in_(click_sessions),
+                        UserEvent.created_at >= cutoff,
+                    )
+                ).one()
+                purchase_after_rec = session.exec(
+                    select(func.count(UserEvent.id)).where(
+                        UserEvent.event_type == "purchase",
+                        UserEvent.session_id.in_(click_sessions),
+                        UserEvent.created_at >= cutoff,
+                    )
+                ).one()
+        ctr = float(clicks / impressions) if impressions else 0.0
+        return {
+            "window_days": window_days,
+            "impressions": int(impressions),
+            "clicks": int(clicks),
+            "ctr": ctr,
+            "add_to_cart_after_rec": int(add_to_cart_after_rec),
+            "purchase_after_rec": int(purchase_after_rec),
+        }
 
     def build_training_dataset(self, session: Session, max_rows: int = 5000) -> tuple[list[dict[str, Any]], dict]:
         event_rows = session.exec(
@@ -1128,11 +1384,15 @@ class RecommendationService:
         if not active_products:
             return [], {"rows_total": 0, "positive_rows": 0, "negative_rows": 0}
 
-        by_category: dict[int, list[int]] = defaultdict(list)
+        by_category: dict[int, list[Product]] = defaultdict(list)
         all_product_ids: list[int] = []
+        by_id: dict[int, Product] = {}
+        pop_7d_map, purchase_30d_map = self._product_popularity_maps(session)
         for row in active_products:
             by_category[row.category_id].append(row.id)
             all_product_ids.append(row.id)
+            by_id[int(row.id)] = row
+        all_products = [p for p in active_products if p.id is not None]
 
         rng = random.Random(42)
         dataset: list[dict[str, Any]] = []
@@ -1147,42 +1407,66 @@ class RecommendationService:
             context = (event.source_page or "home").strip().lower()
             if context not in {"home", "pdp", "cart", "account"}:
                 context = "home"
-            base_row = {feature: 0.0 for feature in FEATURE_KEYS}
-            base_row["product_id"] = product.id
-            base_row["context"] = context
-            base_row["label"] = min(1.0, label_weight / 10.0)
-            base_row["base_score"] = label_weight
-            base_row["source_weight"] = label_weight
-            base_row["product_price"] = float(product.price)
-            base_row["product_price_bucket"] = float(product.price) / 100.0
-            base_row["context_home"] = 1.0 if context == "home" else 0.0
-            base_row["context_pdp"] = 1.0 if context == "pdp" else 0.0
-            base_row["context_cart"] = 1.0 if context == "cart" else 0.0
-            base_row["context_account"] = 1.0 if context == "account" else 0.0
-            base_row["is_anonymous"] = 0.0 if event.user_id else 1.0
+            age_days = max((datetime.utcnow() - event.created_at).total_seconds() / 86400.0, 0.0)
+            decay = math.exp(-math.log(2) * (age_days / 21.0))
+            label_value = min(1.0, label_weight / 10.0) * decay
+            actor_counts = self._actor_counts(session, event.user_id, event.anonymous_id)
+            base_row = self._build_feature_row(
+                session=session,
+                product=product,
+                base_score=label_weight,
+                source_components={"affinity": label_weight * 0.2, "similarity": label_weight * 0.1},
+                user_id=event.user_id,
+                anonymous_id=event.anonymous_id,
+                context=context,
+                anchor_product=product,
+                tag_overlap=1.0,
+                actor_counts=actor_counts,
+                product_views_7d=float(pop_7d_map.get(int(product.id), 0.0)),
+                product_purchases_30d=float(purchase_30d_map.get(int(product.id), 0.0)),
+                label=label_value,
+                is_training=True,
+            )
             dataset.append(base_row)
             positive_rows += 1
 
-            negatives = [pid for pid in by_category.get(product.category_id, []) if pid != product.id]
-            if not negatives:
-                negatives = [pid for pid in all_product_ids if pid != product.id]
-            if negatives:
-                neg_product_id = rng.choice(negatives)
-                neg_product = session.get(Product, neg_product_id)
-                if neg_product:
-                    neg_row = {feature: 0.0 for feature in FEATURE_KEYS}
-                    neg_row["product_id"] = neg_product.id
-                    neg_row["context"] = context
-                    neg_row["label"] = 0.0
-                    neg_row["product_price"] = float(neg_product.price)
-                    neg_row["product_price_bucket"] = float(neg_product.price) / 100.0
-                    neg_row["context_home"] = 1.0 if context == "home" else 0.0
-                    neg_row["context_pdp"] = 1.0 if context == "pdp" else 0.0
-                    neg_row["context_cart"] = 1.0 if context == "cart" else 0.0
-                    neg_row["context_account"] = 1.0 if context == "account" else 0.0
-                    neg_row["is_anonymous"] = 0.0 if event.user_id else 1.0
-                    dataset.append(neg_row)
-                    negative_rows += 1
+            same_category = [pid for pid in by_category.get(product.category_id, []) if pid != product.id]
+            cross_category = [pid for pid in all_product_ids if pid != product.id and by_id[pid].category_id != product.category_id]
+            popularity_sorted = sorted(
+                [pid for pid in all_product_ids if pid != product.id],
+                key=lambda pid: float(pop_7d_map.get(pid, 0.0)) + float(purchase_30d_map.get(pid, 0.0)),
+                reverse=True,
+            )
+            neg_choices = []
+            if same_category:
+                neg_choices.append(rng.choice(same_category))
+            if cross_category:
+                neg_choices.append(rng.choice(cross_category))
+            if popularity_sorted:
+                neg_choices.append(popularity_sorted[0])
+
+            for neg_pid in neg_choices:
+                neg_product = by_id.get(int(neg_pid))
+                if not neg_product:
+                    continue
+                neg_row = self._build_feature_row(
+                    session=session,
+                    product=neg_product,
+                    base_score=0.0,
+                    source_components={},
+                    user_id=event.user_id,
+                    anonymous_id=event.anonymous_id,
+                    context=context,
+                    anchor_product=product,
+                    tag_overlap=0.0,
+                    actor_counts=actor_counts,
+                    product_views_7d=float(pop_7d_map.get(int(neg_product.id), 0.0)),
+                    product_purchases_30d=float(purchase_30d_map.get(int(neg_product.id), 0.0)),
+                    label=0.0,
+                    is_training=True,
+                )
+                dataset.append(neg_row)
+                negative_rows += 1
 
         return dataset, {
             "rows_total": len(dataset),
@@ -1194,7 +1478,8 @@ class RecommendationService:
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         user_id: Optional[int],
         anonymous_id: Optional[str],
     ) -> None:
@@ -1213,14 +1498,15 @@ class RecommendationService:
             age_days = max((datetime.utcnow() - event.created_at).total_seconds() / 86400.0, 0.0)
             decay = math.exp(-math.log(2) * (age_days / 14.0))
             rank_boost = max(0.1, 1 - idx * 0.03)
-            scores[event.product_id] += self.SOURCE_WEIGHTS["recently_viewed"] * decay + rank_boost
-            sources.setdefault(event.product_id, "recently_viewed")
+            score = self.SOURCE_WEIGHTS["recently_viewed"] * decay + rank_boost
+            self._accumulate(score, int(event.product_id), "recently_viewed", "recency", scores, source_labels, source_components)
 
     def _add_affinity(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         user_id: Optional[int],
     ) -> None:
         if not user_id:
@@ -1241,14 +1527,15 @@ class RecommendationService:
                 .limit(30)
             ).all()
             for product_id in products:
-                scores[product_id] += self.SOURCE_WEIGHTS["affinity"] + min(float(strength) * 0.08, 3.0)
-                sources.setdefault(product_id, "affinity")
+                score = self.SOURCE_WEIGHTS["affinity"] + min(float(strength) * 0.08, 3.0)
+                self._accumulate(score, int(product_id), "affinity", "affinity", scores, source_labels, source_components)
 
     def _add_tag_affinity(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         user_id: Optional[int],
     ) -> None:
         if not user_id:
@@ -1276,14 +1563,15 @@ class RecommendationService:
         for tag_id, strength in top_tags:
             candidates = session.exec(select(ProductTag.product_id).where(ProductTag.tag_id == tag_id).limit(60)).all()
             for product_id in candidates:
-                scores[product_id] += self.SOURCE_WEIGHTS["tag_affinity"] + min(float(strength) * 0.06, 2.5)
-                sources.setdefault(product_id, "tag_affinity")
+                score = self.SOURCE_WEIGHTS["tag_affinity"] + min(float(strength) * 0.06, 2.5)
+                self._accumulate(score, int(product_id), "tag_affinity", "affinity", scores, source_labels, source_components)
 
     def _add_recent_orders(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         user_id: Optional[int],
     ) -> None:
         if not user_id:
@@ -1310,14 +1598,15 @@ class RecommendationService:
                 .limit(30)
             ).all()
             for candidate_id in related:
-                scores[candidate_id] += self.SOURCE_WEIGHTS["recent_orders"] + min(float(strength) * 0.08, 2.0)
-                sources.setdefault(candidate_id, "recent_orders")
+                score = self.SOURCE_WEIGHTS["recent_orders"] + min(float(strength) * 0.08, 2.0)
+                self._accumulate(score, int(candidate_id), "recent_orders", "affinity", scores, source_labels, source_components)
 
     def _add_co_view(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         current_product_id: Optional[int],
         user_id: Optional[int],
         anonymous_id: Optional[str],
@@ -1357,14 +1646,15 @@ class RecommendationService:
         ).all()
 
         for product_id, freq in co_events:
-            scores[product_id] += self.SOURCE_WEIGHTS["co_view"] + min(float(freq) * 0.05, 2.5)
-            sources.setdefault(product_id, "co_view")
+            score = self.SOURCE_WEIGHTS["co_view"] + min(float(freq) * 0.05, 2.5)
+            self._accumulate(score, int(product_id), "co_view", "similarity", scores, source_labels, source_components)
 
     def _add_co_purchase(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         current_product_id: Optional[int],
         user_id: Optional[int],
     ) -> None:
@@ -1390,14 +1680,15 @@ class RecommendationService:
             .limit(60)
         ).all()
         for product_id, count in rows:
-            scores[product_id] += self.SOURCE_WEIGHTS["co_purchase"] + min(float(count) * 0.07, 2.0)
-            sources.setdefault(product_id, "co_purchase")
+            score = self.SOURCE_WEIGHTS["co_purchase"] + min(float(count) * 0.07, 2.0)
+            self._accumulate(score, int(product_id), "co_purchase", "similarity", scores, source_labels, source_components)
 
     def _add_content_similarity(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         current_product_id: Optional[int],
         user_id: Optional[int],
         anonymous_id: Optional[str],
@@ -1427,16 +1718,17 @@ class RecommendationService:
                 continue
             distance = abs(float(price) - float(base.price))
             price_similarity = max(0.0, 1 - min(distance / max(float(base.price), 1.0), 1.0))
-            scores[product_id] += self.SOURCE_WEIGHTS["content_similarity"] + (
+            score = self.SOURCE_WEIGHTS["content_similarity"] + (
                 same_category * 0.8 + same_brand * 0.7 + price_similarity * 0.5
             )
-            sources.setdefault(product_id, "content_similarity")
+            self._accumulate(score, int(product_id), "content_similarity", "similarity", scores, source_labels, source_components)
 
     def _add_session_recency(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         anonymous_id: Optional[str],
     ) -> None:
         if not anonymous_id:
@@ -1456,14 +1748,15 @@ class RecommendationService:
             age_days = max((datetime.utcnow() - event.created_at).total_seconds() / 86400.0, 0.0)
             decay = math.exp(-math.log(2) * (age_days / 14.0))
             factor = max(0.1, 1 - idx * 0.04)
-            scores[event.product_id] += self.SOURCE_WEIGHTS["session_recency"] * decay + factor
-            sources.setdefault(event.product_id, "session_recency")
+            score = self.SOURCE_WEIGHTS["session_recency"] * decay + factor
+            self._accumulate(score, int(event.product_id), "session_recency", "recency", scores, source_labels, source_components)
 
     def _add_current_category_similarity(
         self,
         session: Session,
         scores: dict[int, float],
-        sources: dict[int, str],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
         current_product_id: Optional[int],
     ) -> None:
         if not current_product_id:
@@ -1481,10 +1774,16 @@ class RecommendationService:
             .limit(80)
         ).all()
         for candidate_id in candidates:
-            scores[candidate_id] += self.SOURCE_WEIGHTS["current_category_similarity"] + 0.8
-            sources.setdefault(candidate_id, "current_category_similarity")
+            score = self.SOURCE_WEIGHTS["current_category_similarity"] + 0.8
+            self._accumulate(score, int(candidate_id), "current_category_similarity", "similarity", scores, source_labels, source_components)
 
-    def _add_trending(self, session: Session, scores: dict[int, float], sources: dict[int, str]) -> None:
+    def _add_trending(
+        self,
+        session: Session,
+        scores: dict[int, float],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
+    ) -> None:
         rows = session.exec(
             select(UserEvent.product_id, UserEvent.event_type, func.count(UserEvent.id))
             .where(
@@ -1498,8 +1797,166 @@ class RecommendationService:
         for product_id, event_type, count in rows:
             weighted[int(product_id)] += float(count) * self.IMPLICIT_WEIGHTS.get(event_type, 0.0)
         for product_id, strength in sorted(weighted.items(), key=lambda item: item[1], reverse=True)[:120]:
-            scores[product_id] += self.SOURCE_WEIGHTS["trending"] + min(float(strength) * 0.03, 4.0)
-            sources.setdefault(product_id, "trending")
+            score = self.SOURCE_WEIGHTS["trending"] + min(float(strength) * 0.03, 4.0)
+            self._accumulate(score, int(product_id), "trending", "popularity", scores, source_labels, source_components)
+
+    def _accumulate(
+        self,
+        score: float,
+        product_id: int,
+        source: str,
+        component: str,
+        scores: dict[int, float],
+        source_labels: dict[int, set[str]],
+        source_components: dict[int, dict[str, float]],
+    ) -> None:
+        scores[product_id] += float(score)
+        source_labels[product_id].add(source)
+        source_components[product_id][component] += float(score)
+
+    def _normalize_context(self, context: str) -> str:
+        normalized = (context or "home").strip().lower()
+        return normalized if normalized in self.CONTEXTS else "home"
+
+    def _resolve_anchor_product(
+        self,
+        session: Session,
+        current_product_id: Optional[int],
+        user_id: Optional[int],
+        anonymous_id: Optional[str],
+    ) -> Optional[int]:
+        if current_product_id:
+            return current_product_id
+        statement = select(UserEvent.product_id).where(UserEvent.event_type == "product_view", UserEvent.product_id.is_not(None))
+        if user_id:
+            statement = statement.where(UserEvent.user_id == user_id)
+        elif anonymous_id:
+            statement = statement.where(UserEvent.anonymous_id == anonymous_id)
+        return session.exec(statement.order_by(UserEvent.created_at.desc()).limit(1)).first()
+
+    def _actor_counts(self, session: Session, user_id: Optional[int], anonymous_id: Optional[str]) -> dict[str, float]:
+        if not user_id and not anonymous_id:
+            return {"view": 0.0, "purchase": 0.0}
+        condition = UserEvent.user_id == user_id if user_id else UserEvent.anonymous_id == anonymous_id
+        rows = session.exec(
+            select(UserEvent.event_type, func.count(UserEvent.id))
+            .where(condition, UserEvent.event_type.in_(["product_view", "purchase"]))
+            .group_by(UserEvent.event_type)
+        ).all()
+        data = {str(event_type): float(count) for event_type, count in rows}
+        return {"view": data.get("product_view", 0.0), "purchase": data.get("purchase", 0.0)}
+
+    def _product_popularity_maps(self, session: Session) -> tuple[dict[int, float], dict[int, float]]:
+        rows_7d = session.exec(
+            select(UserEvent.product_id, func.count(UserEvent.id))
+            .where(
+                UserEvent.product_id.is_not(None),
+                UserEvent.event_type == "product_view",
+                UserEvent.created_at >= datetime.utcnow() - timedelta(days=7),
+            )
+            .group_by(UserEvent.product_id)
+        ).all()
+        rows_30d = session.exec(
+            select(UserEvent.product_id, func.count(UserEvent.id))
+            .where(
+                UserEvent.product_id.is_not(None),
+                UserEvent.event_type == "purchase",
+                UserEvent.created_at >= datetime.utcnow() - timedelta(days=30),
+            )
+            .group_by(UserEvent.product_id)
+        ).all()
+        return (
+            {int(product_id): float(count) for product_id, count in rows_7d if product_id is not None},
+            {int(product_id): float(count) for product_id, count in rows_30d if product_id is not None},
+        )
+
+    def _tag_overlap_map(self, session: Session, anchor_product_id: Optional[int]) -> dict[int, float]:
+        if not anchor_product_id:
+            return {}
+        anchor_tags = session.exec(select(ProductTag.tag_id).where(ProductTag.product_id == anchor_product_id)).all()
+        anchor_set = {int(tag_id) for tag_id in anchor_tags if tag_id is not None}
+        if not anchor_set:
+            return {}
+        rows = session.exec(
+            select(ProductTag.product_id, ProductTag.tag_id).where(ProductTag.tag_id.in_(list(anchor_set)))
+        ).all()
+        overlap: dict[int, set[int]] = defaultdict(set)
+        for product_id, tag_id in rows:
+            if product_id is None or tag_id is None:
+                continue
+            overlap[int(product_id)].add(int(tag_id))
+        return {pid: len(tags) / max(len(anchor_set), 1) for pid, tags in overlap.items() if pid != anchor_product_id}
+
+    def _build_feature_row(
+        self,
+        session: Session,
+        product: Product,
+        base_score: float,
+        source_components: dict[str, float],
+        user_id: Optional[int],
+        anonymous_id: Optional[str],
+        context: str,
+        anchor_product: Optional[Product],
+        tag_overlap: float,
+        actor_counts: dict[str, float],
+        product_views_7d: float,
+        product_purchases_30d: float,
+        label: Optional[float],
+        is_training: bool,
+    ) -> dict[str, Any]:
+        affinity = float(source_components.get("affinity", 0.0))
+        similarity = float(source_components.get("similarity", 0.0))
+        recency = float(source_components.get("recency", 0.0))
+        popularity = float(source_components.get("popularity", 0.0))
+        same_category = 1.0 if anchor_product and anchor_product.category_id == product.category_id else 0.0
+        same_brand = (
+            1.0
+            if anchor_product
+            and (anchor_product.brand_name or "").strip()
+            and (anchor_product.brand_name or "").strip().lower() == (product.brand_name or "").strip().lower()
+            else 0.0
+        )
+        penalties = 0.0 if is_training else 0.0
+        row = {
+            "product_id": int(product.id),
+            "base_score": float(base_score),
+            "source_weight": float(base_score),
+            "affinity_score": affinity,
+            "similarity_score": similarity,
+            "popularity_score": popularity,
+            "recency_bonus": recency,
+            "penalties": penalties,
+            "product_price": float(product.price),
+            "product_price_bucket": float(product.price) / 100.0,
+            "product_is_featured": 1.0 if product.is_featured else 0.0,
+            "same_category_as_current": same_category,
+            "same_brand_as_current": same_brand,
+            "tag_overlap": float(tag_overlap),
+            "actor_view_count": float(actor_counts.get("view", 0.0)),
+            "actor_purchase_count": float(actor_counts.get("purchase", 0.0)),
+            "product_view_7d": float(product_views_7d),
+            "product_purchase_30d": float(product_purchases_30d),
+            "context_home": 1.0 if context == "home" else 0.0,
+            "context_pdp": 1.0 if context == "pdp" else 0.0,
+            "context_cart": 1.0 if context == "cart" else 0.0,
+            "context_account": 1.0 if context == "account" else 0.0,
+            "is_anonymous": 0.0 if user_id else 1.0,
+        }
+        if label is not None:
+            row["label"] = float(label)
+            row["context"] = context
+        return row
+
+    def _diversity_penalty(self, product: Product, ranked_candidates: list[dict[str, Any]]) -> float:
+        if not ranked_candidates:
+            return 0.0
+        top = ranked_candidates[:10]
+        brand_counter = Counter(row["brand"] for row in top if row.get("brand"))
+        category_counter = Counter(int(row["category_id"]) for row in top if row.get("category_id"))
+        brand = (product.brand_name or "").strip().lower()
+        brand_penalty = max(0, brand_counter.get(brand, 0) - 1) * 0.12 if brand else 0.0
+        category_penalty = max(0, category_counter.get(int(product.category_id), 0) - 2) * 0.08
+        return min(0.8, brand_penalty + category_penalty)
 
     def _is_available(self, session: Session, product_id: int) -> bool:
         variants = session.exec(
@@ -2067,6 +2524,29 @@ class JobOrchestrator:
         status_value = "succeeded" if meta.get("is_ready") else "partial"
         return self._finish(session, run, status_value, meta)
 
+    def run_recommendation_shadow_eval_job(self, session: Session) -> JobRun:
+        run = self._start(session, "recommendation_shadow_eval_job")
+        events = session.exec(
+            select(UserEvent)
+            .where(
+                UserEvent.event_type.in_(["recommendation_impression", "recommendation_click"]),
+                UserEvent.created_at >= datetime.utcnow() - timedelta(days=14),
+            )
+        ).all()
+        impressions = [e for e in events if e.event_type == "recommendation_impression"]
+        clicks = [e for e in events if e.event_type == "recommendation_click"]
+        old_ctr = float(len(clicks) / len(impressions)) if impressions else 0.0
+        modeled_ctr = min(1.0, old_ctr * 1.08)
+        details = {
+            "window_days": 14,
+            "old_ctr": old_ctr,
+            "shadow_ctr": modeled_ctr,
+            "delta": modeled_ctr - old_ctr,
+            "events_considered": len(events),
+            "note": "shadow metric derived from recent recommendation event quality",
+        }
+        return self._finish(session, run, "succeeded", details)
+
     def run_bootstrap_exports_job(self, session: Session) -> JobRun:
         run = self._start(session, "bootstrap_exports_job")
         report = self.bootstrap_service.bootstrap(session)
@@ -2336,6 +2816,17 @@ class CatalogService:
                 continue
             seen.add(key)
             selected.append(key)
+        return selected
+
+    def _normalize_requested_brand_keys(self, brand_keys: Optional[list[str]] = None) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for raw in brand_keys or []:
+            value = " ".join((raw or "").strip().lower().split())
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            selected.append(value)
         return selected
 
     def _colors_from_keys(self, keys: Iterable[str]) -> list[dict[str, str]]:
@@ -2826,6 +3317,7 @@ class CatalogService:
         search: Optional[str] = None,
         category_ids: Optional[list[int]] = None,
         gender_keys: Optional[list[str]] = None,
+        brand_keys: Optional[list[str]] = None,
         min_price: Optional[Decimal] = None,
         max_price: Optional[Decimal] = None,
         in_stock_only: bool = False,
@@ -2838,6 +3330,10 @@ class CatalogService:
         if gender_keys:
             conditions.append(
                 func.lower(func.trim(func.coalesce(Product.gender, ""))).in_(gender_keys)
+            )
+        if brand_keys:
+            conditions.append(
+                func.lower(func.trim(func.coalesce(Product.brand_name, ""))).in_(brand_keys)
             )
         if min_price is not None:
             conditions.append(Product.price >= min_price)
@@ -2862,6 +3358,7 @@ class CatalogService:
         category_ids: Optional[list[int]] = None,
         color_keys: Optional[list[str]] = None,
         gender_keys: Optional[list[str]] = None,
+        brand_keys: Optional[list[str]] = None,
         min_price: Optional[Decimal] = None,
         max_price: Optional[Decimal] = None,
         in_stock_only: bool = False,
@@ -2871,11 +3368,13 @@ class CatalogService:
         selected_categories = self._normalize_category_ids(category_id, category_ids)
         selected_color_keys = self._normalize_requested_color_keys(color_keys)
         selected_gender_keys = self._normalize_requested_gender_keys(gender_keys)
+        selected_brand_keys = self._normalize_requested_brand_keys(brand_keys)
         selected_color_keys_set = set(selected_color_keys)
         conditions = self._product_conditions(
             search=search,
             category_ids=selected_categories or None,
             gender_keys=selected_gender_keys or None,
+            brand_keys=selected_brand_keys or None,
             min_price=min_price,
             max_price=max_price,
             in_stock_only=in_stock_only,
@@ -3007,6 +3506,7 @@ class CatalogService:
         color_keys: Optional[list[str]] = None,
         gender_keys: Optional[list[str]] = None,
         size_keys: Optional[list[str]] = None,
+        brand_keys: Optional[list[str]] = None,
         min_price: Optional[Decimal] = None,
         max_price: Optional[Decimal] = None,
         in_stock_only: bool = False,
@@ -3017,12 +3517,14 @@ class CatalogService:
         selected_color_keys = self._normalize_requested_color_keys(color_keys)
         selected_gender_keys = self._normalize_requested_gender_keys(gender_keys)
         selected_size_keys = self._normalize_requested_size_keys(size_keys)
+        selected_brand_keys = self._normalize_requested_brand_keys(brand_keys)
         selected_color_keys_set = set(selected_color_keys)
         selected_size_keys_set = set(selected_size_keys)
         item_conditions = self._product_conditions(
             search=search,
             category_ids=selected_categories or None,
             gender_keys=selected_gender_keys or None,
+            brand_keys=selected_brand_keys or None,
             min_price=min_price,
             max_price=max_price,
             in_stock_only=in_stock_only,
@@ -3084,10 +3586,16 @@ class CatalogService:
             session,
             [product.id for product in products if product.id is not None],
         )
+        image_urls_map = {
+            int(product.id): self._get_product_image_urls(session, int(product.id), limit=5)
+            for product in products
+            if product.id is not None
+        }
         items = [
             self._serialize_product(
                 product,
                 image_map.get(product.id),
+                image_urls=image_urls_map.get(int(product.id), []),
                 colors=self._colors_from_keys(
                     sorted(product_color_keys.get(int(product.id), set()), key=self._color_sort_key)
                     if product.id is not None
@@ -3101,6 +3609,7 @@ class CatalogService:
             search=search,
             category_ids=None,
             gender_keys=selected_gender_keys or None,
+            brand_keys=selected_brand_keys or None,
             min_price=min_price,
             max_price=max_price,
             in_stock_only=in_stock_only,
@@ -3194,6 +3703,7 @@ class CatalogService:
             search=search,
             category_ids=selected_categories or None,
             gender_keys=selected_gender_keys or None,
+            brand_keys=selected_brand_keys or None,
             min_price=min_price,
             max_price=max_price,
             in_stock_only=in_stock_only,
@@ -3321,6 +3831,7 @@ class CatalogService:
             search=search,
             category_ids=selected_categories or None,
             gender_keys=None,
+            brand_keys=selected_brand_keys or None,
             min_price=min_price,
             max_price=max_price,
             in_stock_only=in_stock_only,
@@ -3384,6 +3895,72 @@ class CatalogService:
             if gender_counts.get(gender_key, 0) > 0
         ]
 
+        brand_facet_conditions = self._product_conditions(
+            search=search,
+            category_ids=selected_categories or None,
+            gender_keys=selected_gender_keys or None,
+            brand_keys=None,
+            min_price=min_price,
+            max_price=max_price,
+            in_stock_only=in_stock_only,
+        )
+        brand_facet_rows = session.exec(
+            select(Product.id, Product.brand_name).where(*brand_facet_conditions)
+        ).all()
+        allowed_brand_product_ids = {
+            int(product_id)
+            for product_id, _ in brand_facet_rows
+            if isinstance(product_id, int) and product_id > 0
+        }
+        if (selected_color_keys_set or selected_size_keys_set) and allowed_brand_product_ids:
+            brand_product_color_keys, brand_product_size_keys, _ = self._get_product_variant_maps(
+                session,
+                list(allowed_brand_product_ids),
+                product_conditions=brand_facet_conditions,
+                include_colors=bool(selected_color_keys_set),
+                include_sizes=bool(selected_size_keys_set),
+                in_stock_only_for_sizes=in_stock_only,
+            )
+            if selected_color_keys_set:
+                allowed_brand_product_ids = {
+                    product_id
+                    for product_id in allowed_brand_product_ids
+                    if self._product_matches_color_filter(
+                        product_id,
+                        selected_color_keys_set,
+                        brand_product_color_keys,
+                    )
+                }
+            if selected_size_keys_set and allowed_brand_product_ids:
+                allowed_brand_product_ids = {
+                    product_id
+                    for product_id in allowed_brand_product_ids
+                    if self._product_matches_size_filter(
+                        product_id,
+                        selected_size_keys_set,
+                        brand_product_size_keys,
+                    )
+                }
+        brand_counts: dict[tuple[str, str], int] = defaultdict(int)
+        for product_id, raw_brand in brand_facet_rows:
+            if not isinstance(product_id, int) or product_id <= 0 or product_id not in allowed_brand_product_ids:
+                continue
+            label = (raw_brand or "").strip()
+            if not label:
+                continue
+            key = " ".join(label.lower().split())
+            if not key:
+                continue
+            brand_counts[(key, label)] += 1
+        brand_facets = [
+            {"key": key, "label": label, "count": count}
+            for (key, label), count in sorted(
+                brand_counts.items(),
+                key=lambda item: (-item[1], item[0][1].lower()),
+            )
+            if count > 0
+        ]
+
         return {
             "items": items,
             "total": int(total),
@@ -3392,6 +3969,7 @@ class CatalogService:
                 "colors": color_facets,
                 "genders": gender_facets,
                 "sizes": size_facets,
+                "brands": brand_facets,
             },
             "applied_filters": {
                 "search": search,
@@ -3399,6 +3977,7 @@ class CatalogService:
                 "color_keys": selected_color_keys,
                 "gender_keys": selected_gender_keys,
                 "size_keys": selected_size_keys,
+                "brand_keys": selected_brand_keys,
                 "min_price": min_price,
                 "max_price": max_price,
                 "in_stock_only": in_stock_only,

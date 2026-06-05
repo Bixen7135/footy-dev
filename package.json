@@ -3,6 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File scripts/start.ps1",
+    "start": "powershell -ExecutionPolicy Bypass -File scripts/start.ps1",
     "dev:all": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 run",
     "dev:all:up": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 up",
     "dev:all:down": "powershell -ExecutionPolicy Bypass -File scripts/dev_stack.ps1 down",

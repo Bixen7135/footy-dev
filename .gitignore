@@ -25,10 +25,13 @@ frontend/.env.local
 
 # Runtime / generated
 exports/
+exports_prepared_full/
 artifacts/
 backups/
 .run/
 *.log
+docs/
+session_summary.md
 
 # OS / IDE
 .DS_Store

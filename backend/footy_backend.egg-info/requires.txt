@@ -7,6 +7,8 @@ pydantic-settings>=2.4.0
 passlib[bcrypt]>=1.7.4
 PyJWT>=2.9.0
 python-multipart>=0.0.9
+lightgbm>=4.5.0
+numpy>=1.26.0
 
 [dev]
 pytest>=8.3.0

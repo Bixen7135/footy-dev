@@ -25,7 +25,12 @@ if (-not $SkipBackup) {
 Write-Output "Remapping categories/gender in backend/footy.db..."
 Push-Location $BackendDir
 try {
-  python scripts/remap_catalog_taxonomy.py
+  $python = "python"
+  $venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
+  if (Test-Path $venvPython) {
+    $python = $venvPython
+  }
+  & $python scripts/remap_catalog_taxonomy.py
   if ($LASTEXITCODE -ne 0) {
     throw "remap_catalog_taxonomy.py failed with exit code $LASTEXITCODE"
   }

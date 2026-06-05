@@ -1938,6 +1938,26 @@ def test_add_to_cart_stock_validation_api():
     assert second.status_code == 409
 
 
+def test_add_to_cart_rejects_missing_price_api():
+    create_db_and_tables()
+    client.cookies.clear()
+    product_id, variant_id = _seed_product(slug="missing-price-product", sku="missing-price-product-v1", stock=5)
+    with Session(engine) as session:
+        product = session.get(Product, product_id)
+        product.price = Decimal("0.00")
+        session.add(product)
+        session.commit()
+
+    response = client.post(
+        "/cart/items",
+        headers={"X-Anonymous-Id": f"anon-missing-price-{uuid4().hex[:8]}"},
+        json={"product_id": product_id, "variant_id": variant_id, "quantity": 1},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Product price unavailable"
+
+
 def test_media_upload_hybrid_api():
     create_db_and_tables()
     admin = _admin_client()
@@ -1981,6 +2001,14 @@ def test_recommendation_model_and_train_endpoints_api():
     model = admin.get("/admin/recommendations/model")
     assert model.status_code == 200
     assert "is_ready" in model.json()
+
+    quality = admin.get("/admin/recommendations/quality?days=14")
+    assert quality.status_code == 200
+    assert "ctr" in quality.json()
+
+    shadow = admin.post("/admin/jobs/recommendation_shadow_eval_job/run")
+    assert shadow.status_code == 200
+    assert shadow.json()["job_name"] == "recommendation_shadow_eval_job"
 
 
 def test_dedupe_jobs_endpoints_api():
